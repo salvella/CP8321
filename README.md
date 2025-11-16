@@ -36,7 +36,13 @@ The `requirements.txt` includes:
 ### Step 2: Download the SICAPv2 Dataset
 
 1. Download from Mendeley Data: https://data.mendeley.com/datasets/9xxm58dvs3/1
-2. Extract to a local directory (e.g., `./SICAPv2`)
+   - If you prefer the CLI, download and unzip directly into this repository root:
+     ```bash
+     curl -L -o SICAPv2.zip https://prod-dcd-datasets-cache-zipfiles.s3.eu-west-1.amazonaws.com/9xxm58dvs3-1.zip
+     unzip SICAPv2.zip -d .
+     rm SICAPv2.zip
+     ```
+2. Ensure the extracted folder lives in this directory (e.g., `./SICAPv2`)
 3. Verify the structure:
    ```
    SICAPv2/
