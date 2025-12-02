@@ -241,10 +241,10 @@ foundation_results/p4_driver_runs/
 You can examine these results without re-running experiments:
 ```bash
 # View a completed experiment
-cat run_results/A_cls/linear_cls/4fold_summary.json
+cat run_results-GOLDEN/A_cls/linear_cls/4fold_summary.json
 
 # List all available pre-computed results
-ls -R run_results/
+ls -R run_results-GOLDEN/
 ```
 
 ### Individual Fold Results
