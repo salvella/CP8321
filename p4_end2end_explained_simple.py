@@ -43,8 +43,8 @@ from torch.utils.data import DataLoader, Dataset
 from hf_processor_loader import load_auto_model, load_image_processor
 from peft import LoraConfig, get_peft_model
 
-CLASSES = ["NC", "G3", "G4", "G5"]  # Gleason classes in SICAPv2 (folder names)
-IMAGE_SIZE = 224  # Common input size for ViT/Conv vision backbones
+CLASSES = ["NC", "G3", "G4", "G5"]  # Gleason classes
+IMAGE_SIZE = 224  # Common input size for ViT
 DEFAULT_BATCH = 16
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
@@ -54,21 +54,25 @@ def log(msg: str) -> None:
     print(f"[p4_end2end_explained_simple] {msg}")
 
 # Load files from the split files
+# It scans a directory for image files and returns records of pairs of
+# image path and each class label (CLASSES has the labels)
 def load_split(split_dir: Path) -> List[tuple[Path, int]]:
     records: List[tuple[Path, int]] = []
     for idx, name in enumerate(CLASSES):
         class_dir = split_dir / name
         if not class_dir.exists():
             continue
-        for ext in ("*.png", "*.jpg", "*.jpeg"):  # accept common patch extensions
+        for ext in ("*.jpg",):  # SICAPv2 patches are stored as .jpg
             for path in class_dir.glob(ext):
                 records.append((path, idx))
     if not records:
-        raise FileNotFoundError(f"No images found in {split_dir}")
+        raise FileNotFoundError(f"No images found in {split_dir} !!")
     return records
 
 # Simple Dataset that loads a patch and returns a tensor able to be used by
-# the foundation model
+# the foundation model. The inputs are the list of (path, labes) from
+# load_split and the processor object that knows how to transform images
+# into a format needed by the model.
 class PatchDataset(Dataset):
     def __init__(self, samples: Sequence[tuple[Path, int]], processor):
         self.samples = list(samples)
@@ -80,28 +84,24 @@ class PatchDataset(Dataset):
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         image = Image.open(path).convert("RGB")
-        try:
-            inputs = self.processor(
-                images=image,
-                return_tensors="pt",
-                size={"height": IMAGE_SIZE, "width": IMAGE_SIZE},
-            )
-        except TypeError:
-            inputs = self.processor(images=image, return_tensors="pt")
 
-        # Processor returns a dict of tensors; pixel_values shape: (1, C, H, W).
-        # We squeeze the batch dimension so DataLoader can stack into (B, C, H, W).
+        inputs = self.processor(
+            images=image,
+            return_tensors="pt",
+            size={"height": IMAGE_SIZE, "width": IMAGE_SIZE},
+        )
+
         return inputs["pixel_values"].squeeze(0), label
 
 # This is the Backbone which is the pretrained feature extractor that turns
-# images into embeddings.
+# images into embeddings vectors. This is the code of the model pipeline.
 class Backbone:
 
 # Responsibilities:
-# - Selects device (CUDA → Apple Metal → CPU) automatically.
-# - Loads pretrained weights via `load_auto_model`.
+# - Selects device automatically to allow optimizing on
+# - Loads pretrained weights via load_auto_model
 # - Optionally injects LoRA adapters.
-# - Implements CLS/mean pooling, so downstream code just calls `forward`
+# - Implements CLS/mean pooling
 
     def __init__(
         self,
@@ -114,21 +114,30 @@ class Backbone:
         lora_dropout: float,
     ):
         # Just to ensure that if we have a GPU we can use it - Macbooks have a
-        # GPU while many Intel PCs do not
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        # GPU while many Intel PCs do not. MPS is Metal Performance Shaders
+        # which is Macbook Apple Silicon GPUs else we use CPUs on PCs
+        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
         self.pooling = pooling
+
+        # Auto load the trained model. This is from the hf_processor_loader.py
+        # helper script to load the HuggingFace model
         self.model = load_auto_model(checkpoint).to(self.device)
 
         # Check if this is a timm model (doesn't have .config attribute)
+        # There are 2 of these - UNI and Wirchow2 and these are stored locally
         self.is_timm_model = not hasattr(self.model, "config")
 
+        # Set whether LoRA will be used. LoRA is a form of fine-tuning
         self.use_lora = bool(use_lora and get_peft_model is not None and LoraConfig is not None)
+
         if self.use_lora:
             # LoRA inserts small trainable matrices into attention/linear layers.
             # Only these adapters get updated; the original backbone weights stay frozen.
-
+            # First call resolve_target_modules to get the layers to target
             resolved_targets = self._resolve_target_modules(checkpoint, target_modules)
+
+            # Create the configuration of the LoRA adapters
             cfg = LoraConfig(
                 r=lora_rank,
                 lora_alpha=lora_alpha,
@@ -136,18 +145,19 @@ class Backbone:
                 bias="none",
                 target_modules=resolved_targets,
             )
-            try:
-                log("Initializing LoRA adapters on encoder.")
-                self.model = get_peft_model(self.model, cfg)
-            except ValueError as exc:
-                log(f"[LoRA] target modules not found ({exc}) !!")
-                self.use_lora = False
+
+            log("Initializing LoRA adapters on encoder.")
+
+            # Wraps the model with the LoRA adapters - trainable matrices
+            self.model = get_peft_model(self.model, cfg)
+
         if not self.use_lora:
             # Freeze a module
             for p in self.model.parameters():
                 p.requires_grad = False
 
-        # Determine hidden size
+        # Determine hidden size - determine the dimensions of the feature
+        # vector to be output
         if self.is_timm_model:
             # For timm models, use num_features or embed_dim
             self.hidden_size = getattr(self.model, "num_features", getattr(self.model, "embed_dim", None))
@@ -158,16 +168,6 @@ class Backbone:
             )
             if self.hidden_size is None and hasattr(self.model, "num_features"):
                 self.hidden_size = self.model.num_features
-
-        if self.hidden_size is None:
-            with torch.no_grad():
-                dummy = torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE).to(self.device)
-                if self.is_timm_model:
-                    outputs = self.model.forward_features(dummy)
-                else:
-                    outputs = self.model(pixel_values=dummy)
-                    outputs = outputs.last_hidden_state
-                self.hidden_size = outputs.shape[-1]
 
     # Implement the forward pass. Also here implement CLS and mean pooling based on
     # the parameter input
@@ -202,7 +202,9 @@ class Backbone:
 # This builds the classifier head we will use. The two models we are using are Linear
 # with one hidden layer and MLP - a simple 2 hidden layer neural network. We use ReLU and
 # we have a dropout rate of 0.2. This obviously could be tuned and we could introduce more
-# complex networks here.
+# complex networks here. We have a very simple architecture where we halve
+# the number of inputs to the hidden layer. Its an arbitrary choice and again
+# could be tuned with more time - more complex NN, different layers, etc.
 def build_head(hidden_dim: int, num_classes: int, kind: str) -> torch.nn.Module:
     if kind == "mlp":
         # Simple two-layer MLP head (common PyTorch Sequential pattern)
@@ -214,22 +216,29 @@ def build_head(hidden_dim: int, num_classes: int, kind: str) -> torch.nn.Module:
         )
     return torch.nn.Linear(hidden_dim, num_classes)
 
-# This is a standard PyTorch training loop
+# This is a standard PyTorch training loop with gradient descent
+# This trains one epoch of the training set.
 def train_epoch(backbone: Backbone, head: torch.nn.Module, loader: DataLoader, optimizer, device: torch.device, autocast_device: str):
     head.train()
+
+    # If LoRA is being used the weights in the LoRA matrices will need to be
+    # trained else we are just evaluating the frozen matrix
     if backbone.use_lora:
         backbone.model.train()
     else:
         backbone.model.eval()
     total_loss = 0.0
+
     criterion = torch.nn.CrossEntropyLoss()
     use_autocast = torch.cuda.is_available()
+
     for pixels, labels in loader:
         optimizer.zero_grad()
         pixels = pixels.to(device)
         labels = labels.to(device)
         if use_autocast:
-            # autocast does mixed-precision on CUDA/MPS for faster/cheaper training
+            # Autocast does mixed precision. It let's PyTorch doptimize the
+            # precision of floats ao that it runs better on Mac GPUs
             with torch.autocast(device_type=autocast_device, dtype=torch.float16):
                 embeddings = backbone.forward(pixels)
                 logits = head(embeddings if backbone.use_lora else embeddings.detach())
@@ -285,40 +294,36 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, probs: np.ndarray) -
         "kappa_quadratic": cohen_kappa_score(y_true, y_pred, weights="quadratic"),
         "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
     }
-    try:
-        metrics["auc_weighted"] = roc_auc_score(y_true, probs, multi_class="ovr", average="weighted")
-    except ValueError:
-        metrics["auc_weighted"] = float("nan")
+    metrics["auc_weighted"] = roc_auc_score(y_true, probs, multi_class="ovr", average="weighted")
+
     return metrics
 
 # Entry-point for the function
 
 def main():
 
-    parser = argparse.ArgumentParser(description="End-to-end SICAPv2 classification with foundation models.")
-    parser.add_argument("--data-dir", type=str, default="data", help="Folder containing train/valid subdirectories.")
-    parser.add_argument("--test-dir", type=str, default=None, help="Folder containing test subdirectories.")
+    parser = argparse.ArgumentParser(description="SICAPv2 classification with foundation models.")
+    parser.add_argument("--data-dir", type=str, default="data", help="Folder containing data")
+    parser.add_argument("--test-dir", type=str, default=None, help="Folder containing test")
     parser.add_argument(
         "--encoder",
         type=str,
         default="facebook/dinov2-base",
         choices=[
             "facebook/dinov2-base",
-            "facebook/dinov2-small",
             "owkin/phikon",
-            "ikim-uk-essen/BiomedCLIP_ViT_patch16_224",
             "/Users/salvatorevella/Documents/GitHub/DataScience/CP8321/Project/UNI_model", # Stored locally only
             "/Users/salvatorevella/Documents/GitHub/DataScience/CP8321/Project/Virchow2",  # Stored locally only
         ],
         help="Choose which foundation model checkpoint to use",
     )
-    parser.add_argument("--pooling", choices=["cls", "mean"], default="cls", help="Whether to use CLS token or mean pooling for embeddings.")
-    parser.add_argument("--use-lora", action="store_true", help="Enable LoRA so the encoder can fine-tune.")
+    parser.add_argument("--pooling", choices=["cls", "mean"], default="cls", help="Whether to use CLS token or mean pooling")
+    parser.add_argument("--use-lora", action="store_true", help="Enable LoRA")
     parser.add_argument(
         "--target-modules",
         nargs="+",
         default=["auto"],
-        help="LoRA target modules. Use 'auto' if not sure.",
+        help="LoRA target modules",
     )
     # LoRA tuning knobs: rank/alpha scale adapter capacity; dropout regularizes adapters.
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank.")
@@ -337,18 +342,18 @@ def main():
         "--early-stop-patience",
         type=int,
         default=0,
-        help="Stop training if validation metric fails to improve for this many epochs (0 disables).",
+        help="Stop training based on validation metric",
     )
     parser.add_argument(
         "--early-stop-metric",
         choices=["accuracy", "f1_macro", "kappa_quadratic"],
         default="accuracy",
-        help="Metric used to decide early stopping/improvement.",
+        help="Metric used to decide early stopping",
     )
 
     # Batch size and learning rate
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH, help="Batch size for PyTorch DataLoaders.")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for AdamW optimizer.")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
 
     parser.add_argument("--output-json", type=str, default="foundation_results/p4_end2end_metrics.json", help="Where to save metrics JSON.")
 
@@ -398,17 +403,16 @@ def main():
     classifier_type = args.classifier
 
     if classifier_type in {"linear", "mlp"}:
-        # --- Neural head branch (trainable in PyTorch) ---
+        # Neural network head - these will be trained
         head = build_head(backbone.hidden_size, len(CLASSES), classifier_type).to(backbone.device)
         params = list(head.parameters()) + (list(backbone.model.parameters()) if backbone.use_lora else [])
         optimizer = torch.optim.AdamW(params, lr=args.lr)
-        autocast_device = "cuda" if torch.cuda.is_available() else "mps"
+        autocast_device = "mps"
 
         if backbone.use_lora:
-            phase_msg = "Fine-tuning classifier head (LoRA enabled)."
+            phase_msg = "LoRA enabled"
         else:
-            phase_msg = "Training frozen-head classifier."
-
+            phase_msg = "No LoRA used"
         log(phase_msg)
 
         best_metric = -float("inf")
@@ -422,7 +426,8 @@ def main():
             y_val, p_val, prob_val = run_inference(backbone, head, valid_loader, backbone.device)
             val_metrics = compute_metrics(y_val, p_val, prob_val)
 
-            # Early stopping compares a chosen metric across epochs.
+            # Early stopping compares a chosen metric across epochs to see
+            # if we are improving or we should stop.
             metric_value = val_metrics.get(args.early_stop_metric, val_metrics.get("accuracy", 0.0))
             improved = metric_value > best_metric + 1e-6
             if improved:
@@ -442,6 +447,8 @@ def main():
                 if patience and epochs_without_improve >= patience:
                     log(f"Early stopping triggered (no {args.early_stop_metric} improvement for {patience} epoch(s)).")
                     break
+
+        # Set the weights back to the best metric state
 
         head.load_state_dict(best_head_state)
         if backbone.use_lora and best_backbone_state is not None:
@@ -482,6 +489,7 @@ def main():
     test_metrics = compute_metrics(y_test, p_test, prob_test)
     log("Evaluating Gleason grading performance.")
 
+    # Print out the metrics
     log("Test metrics:")
     for key, value in test_metrics.items():
         if key == "confusion_matrix":
@@ -489,6 +497,7 @@ def main():
         else:
             log(f"  {key}: {value:.4f}" if isinstance(value, float) else f"  {key}: {value}")
 
+    # Write out the JSON file for the run
     output_path = Path(args.output_json)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 

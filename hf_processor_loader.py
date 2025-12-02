@@ -38,8 +38,9 @@ def load_image_processor(checkpoint: str) -> Any:
     )
 
 def load_auto_model(checkpoint: str, **kwargs: Any):
-    """Load Hugging Face models with remote-code support enabled by default, or timm models for local paths."""
-    # Check if this is a local path with timm-style config
+
+    # This code is to handle UNI and Virchow2 that are stored on disk because
+    # these are very large models
     checkpoint_path = Path(checkpoint)
     if checkpoint_path.exists() and checkpoint_path.is_dir():
         config_file = checkpoint_path / "config.json"
